@@ -12,21 +12,26 @@ if (!apiKey) {
 // Initialize the Google Gen AI client
 const ai = new GoogleGenAI({ apiKey: apiKey || 'placeholder-api-key' });
 
-let extractor: any = null;
-
 /**
- * Generates vector embeddings for a given text using local Xenova/all-MiniLM-L6-v2 transformer.
+ * Generates vector embeddings for a given text using the Gemini API (gemini-embedding-2) with 384 dimensions.
  */
 export async function generateEmbedding(text: string): Promise<number[]> {
   try {
-    if (!extractor) {
-      const { pipeline } = await import('@xenova/transformers');
-      extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+    const response = await ai.models.embedContent({
+      model: 'gemini-embedding-2',
+      contents: text,
+      config: {
+        outputDimensionality: 384
+      }
+    });
+
+    if (response.embeddings && response.embeddings.length > 0 && response.embeddings[0].values) {
+      return response.embeddings[0].values as number[];
+    } else {
+      throw new Error('Failed to extract embedding values from Gemini response.');
     }
-    const output = await extractor(text, { pooling: 'mean', normalize: true });
-    return Array.from(output.data) as number[];
   } catch (error) {
-    console.error('Error generating local embedding:', error);
+    console.error('Error generating embedding via Gemini API:', error);
     throw error;
   }
 }
@@ -158,7 +163,7 @@ Rules:
     const fullPrompt = `${systemInstruction}\n\nChat History:\n${formattedHistory}\n\nStudent/Parent Query: ${query}\nAssistant Response:`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-2.5-flash-lite',
       contents: fullPrompt,
     });
 
@@ -171,7 +176,7 @@ Rules:
     let followUps: string[] = [];
     try {
       const followUpResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.5-flash-lite',
         contents: followUpPrompt,
       });
 
