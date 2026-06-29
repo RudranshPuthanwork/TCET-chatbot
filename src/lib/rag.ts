@@ -1,41 +1,32 @@
-import { GoogleGenAI } from '@google/genai';
+import { executeWithFailover } from './gemini-client';
 import { supabase } from './db';
 
-const apiKey = process.env.GEMINI_API_KEY;
-
-if (!apiKey) {
-  console.warn(
-    'WARNING: GEMINI_API_KEY is missing. Ensure GEMINI_API_KEY is set in your .env file.'
-  );
-}
-
-// Initialize the Google Gen AI client
-const ai = new GoogleGenAI({ apiKey: apiKey || 'placeholder-api-key' });
-
 /**
- * Generates vector embeddings for a given text using the Gemini API (gemini-embedding-2) with 384 dimensions.
+ * Generates vector embeddings for a given text using the Gemini API (gemini-embedding-2) with 768 dimensions.
+ * Uses key failover to bypass rate limits.
  */
 export async function generateEmbedding(text: string): Promise<number[]> {
   try {
-    const response = await ai.models.embedContent({
-      model: 'gemini-embedding-2',
-      contents: text,
-      config: {
-        outputDimensionality: 384
+    return await executeWithFailover(async (ai) => {
+      const response = await ai.models.embedContent({
+        model: 'gemini-embedding-2',
+        contents: text,
+        config: {
+          outputDimensionality: 768,
+        },
+      });
+
+      if (response.embeddings && response.embeddings.length > 0 && response.embeddings[0].values) {
+        return response.embeddings[0].values as number[];
+      } else {
+        throw new Error('Failed to extract embedding values from Gemini response.');
       }
     });
-
-    if (response.embeddings && response.embeddings.length > 0 && response.embeddings[0].values) {
-      return response.embeddings[0].values as number[];
-    } else {
-      throw new Error('Failed to extract embedding values from Gemini response.');
-    }
   } catch (error) {
-    console.error('Error generating embedding via Gemini API:', error);
+    console.error('[RAG] Error generating embedding:', error);
     throw error;
   }
 }
-
 
 export interface DocumentSearchResult {
   id: string;
@@ -51,8 +42,8 @@ export interface DocumentSearchResult {
  */
 export async function searchSimilarDocuments(
   query: string,
-  matchThreshold = 0.55,
-  matchCount = 3
+  matchThreshold = 0.35,
+  matchCount = 4
 ): Promise<DocumentSearchResult[]> {
   try {
     const queryEmbedding = await generateEmbedding(query);
@@ -64,13 +55,13 @@ export async function searchSimilarDocuments(
     });
 
     if (error) {
-      console.error('Error calling match_documents RPC:', error);
+      console.error('[RAG] Error calling match_documents RPC:', error);
       return [];
     }
 
     return (data as DocumentSearchResult[]) || [];
   } catch (error) {
-    console.error('Error in searchSimilarDocuments:', error);
+    console.error('[RAG] Error in searchSimilarDocuments:', error);
     return [];
   }
 }
@@ -94,15 +85,17 @@ export interface ChatbotResponse {
 
 /**
  * Main RAG function that takes user query + history and returns a grounded answer.
+ * Optimized with prompt caching, multiple API key rotation, and a single API call for answers and follow-ups.
  */
 export async function generateRAGResponse(
   query: string,
   chatHistory: ChatMessage[] = []
 ): Promise<ChatbotResponse> {
-  if (!apiKey) {
+  const hasKeys = !!(process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY);
+  if (!hasKeys) {
     return {
       answer:
-        '⚠️ **System Configuration Required:** Please configure your `GEMINI_API_KEY` in the environment settings to enable the AI engine.',
+        '⚠️ **System Configuration Required:** Please configure your `GEMINI_API_KEYS` in the environment settings to enable the AI engine.',
       citations: [],
       followUps: [],
     };
@@ -136,13 +129,8 @@ export async function generateRAGResponse(
         .join('\n---\n\n');
     }
 
-    // 3. Format chat history for context window
-    const formattedHistory = chatHistory
-      .slice(-6) // Keep last 6 exchanges for context to avoid context bloat
-      .map((msg) => `${msg.role === 'user' ? 'Student/Parent' : 'Assistant'}: ${msg.content}`)
-      .join('\n');
-
-    // 4. Construct System Prompt (enforces strict grounding and bilingual rules)
+    // 3. Construct System Prompt (enforces strict grounding and bilingual rules)
+    // Note: Passed inside config.systemInstruction to enable implicit prompt caching on Gemini.
     const systemInstruction = `You are the official Thakur College of Engineering and Technology (TCET) Admission Assistant.
 Your goal is to help parents and students get accurate information about admissions, cutoffs, fees, syllabus, placement, and hostel facilities based ONLY on the documents provided in the Context below.
 
@@ -159,48 +147,64 @@ Rules:
 5. If the user asks in Hindi or Marathi, translate the context facts and respond in Hindi or Marathi respectively. Keep a welcoming, respectful tone.
 6. Do NOT mention details like "According to context..." or "Based on source #1...". Speak directly as the official TCET help desk.`;
 
-    // 5. Invoke Gemini LLM (using gemini-1.5-flash or gemini-2.5-flash)
-    const fullPrompt = `${systemInstruction}\n\nChat History:\n${formattedHistory}\n\nStudent/Parent Query: ${query}\nAssistant Response:`;
+    // 4. Format chat history for context window (last 4 exchanges)
+    const formattedHistory = chatHistory.slice(-4).map((msg) => ({
+      role: msg.role === 'model' ? ('model' as const) : ('user' as const),
+      parts: [{ text: msg.content }],
+    }));
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-lite',
-      contents: fullPrompt,
-    });
+    const contents = [
+      ...formattedHistory,
+      {
+        role: 'user' as const,
+        parts: [{ text: query }],
+      },
+    ];
 
-    const answer = response.text || 'No response generated.';
-
-    // 6. Generate dynamic follow-up questions
-    const followUpPrompt = `Based on the user's question: "${query}" and the chatbot's response: "${answer.substring(0, 150)}...", generate 3 short, relevant, and natural follow-up questions a student or parent would ask next.
-    Format your response as a simple JSON array of strings. Do not include markdown code block syntax. Example: ["What are the document submission dates?", "Is there a hostel for girls?", "Can I get a fee waiver?"]`;
-
-    let followUps: string[] = [];
-    try {
-      const followUpResponse = await ai.models.generateContent({
+    // 5. Generate Answer and Follow-ups in a single structured Gemini call
+    const result = await executeWithFailover(async (ai) => {
+      const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-lite',
-        contents: followUpPrompt,
+        contents: contents,
+        config: {
+          systemInstruction: systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'OBJECT',
+            properties: {
+              answer: {
+                type: 'STRING',
+                description:
+                  'The structured response answering the query based on the context. Must translate to Hindi or Marathi if the user query is in Hindi or Marathi.',
+              },
+              followUps: {
+                type: 'ARRAY',
+                items: { type: 'STRING' },
+                description:
+                  'Generate exactly 3 relevant, short, and natural follow-up questions for the student or parent.',
+              },
+            },
+            required: ['answer', 'followUps'],
+          },
+        },
       });
 
-      const rawText = followUpResponse.text?.trim() || '[]';
-      // Clean possible markdown wrapper ```json ... ```
-      const cleanedJson = rawText.replace(/```json/i, '').replace(/```/g, '').trim();
-      followUps = JSON.parse(cleanedJson);
-    } catch (err) {
-      console.warn('Failed to generate follow-ups, using defaults:', err);
-      // Fallback follow-ups depending on intent
-      followUps = [
-        'What was the cutoff for Computer Engineering?',
-        'What are the fees for IT branch?',
-        'What documents are required for Minority Quota?',
-      ];
+      return response.text;
+    });
+
+    if (!result) {
+      throw new Error('Gemini returned an empty response.');
     }
 
+    const parsedResponse = JSON.parse(result);
+
     return {
-      answer,
+      answer: parsedResponse.answer || 'No response generated.',
       citations: matches.length > 0 ? citations : [],
-      followUps: followUps.slice(0, 3), // Ensure max 3
+      followUps: (parsedResponse.followUps || []).slice(0, 3), // Max 3 follow-ups
     };
   } catch (error) {
-    console.error('Error generating chatbot RAG response:', error);
+    console.error('[RAG] Error generating chatbot response:', error);
     return {
       answer:
         'I apologize, but I encountered an error while processing your request. Please try again or contact the TCET Admission Cell directly.',
