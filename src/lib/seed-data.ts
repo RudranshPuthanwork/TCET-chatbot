@@ -167,7 +167,7 @@ export async function seedDatabase() {
     console.log(`[Seed] Successfully seeded ${TCET_FAQS.length} FAQs.`);
   }
 
-  // 2. Seed Pre-computed Document Chunks (0 API calls, 0 timeout risk)
+  // 2. Seed Pre-computed Document Chunks
   console.log('[Seed] Clearing and inserting pre-computed static document chunks...');
 
   const { error: clearDocsError } = await supabase
@@ -178,15 +178,30 @@ export async function seedDatabase() {
     console.error('[Seed] Error clearing document_chunks:', clearDocsError);
   }
 
-  const { error: insertError } = await supabase
-    .from('document_chunks')
-    .insert(embeddedChunks);
-
   let chunkCount = 0;
-  if (insertError) {
-    console.error('[Seed] Error inserting document chunks:', insertError);
-  } else {
-    chunkCount = embeddedChunks.length;
+  let lastError: any = null;
+
+  for (const chunk of embeddedChunks) {
+    const { error: insertError } = await supabase
+      .from('document_chunks')
+      .insert({
+        title: chunk.title,
+        content: chunk.content,
+        source_name: chunk.source_name,
+        source_url: chunk.source_url,
+        embedding: chunk.embedding,
+      });
+
+    if (insertError) {
+      console.error(`[Seed] Error inserting chunk "${chunk.title}":`, insertError);
+      lastError = insertError;
+    } else {
+      chunkCount++;
+    }
+  }
+
+  if (chunkCount === 0 && lastError) {
+    throw new Error(`Document chunk insertion failed: ${lastError?.message || JSON.stringify(lastError)}`);
   }
 
   console.log(`[Seed] Successfully seeded ${chunkCount}/${embeddedChunks.length} document chunks.`);
